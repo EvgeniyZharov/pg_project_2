@@ -1,0 +1,4 @@
+,Database,Table,Index,Index ID,Page Count,Total Index Size (MB),Fragmentation (%)
+0,Company,employee,WorkEmpIndex,5,1233,2344.00,2.03%
+1,Company,employee,SalaryEmpIndex,23,2332,3231.60,0.04%
+2,Company,department,AddressDepartIndex,34,1533,2353.40,1.12%
