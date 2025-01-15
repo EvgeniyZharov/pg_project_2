@@ -2,6 +2,10 @@ from services.DatabaseService import Database_service
 import re
 import pandas as pd
 from statistics import mean
+from collections import defaultdict
+import subprocess
+import sys
+import os
 
 class Optimize_indexes:
 
@@ -571,6 +575,252 @@ class Optimize_indexes:
         index_name = info_by_index_name[2]
         test_index_performance_with_clone(index_name, index_definition, original_table)
         self.database_service.close_connection()
+
+    def get_low_usage_indexes(self, itr_threshold):
+        """
+        Получение индексов с низким использованием (по порогу ITR и квартилям)
+
+        itr_threshold: float — пороговое значение ITR.
+        """
+
+        cursor = self.database_service.get_connection(self.host, self.port, self.user, self.password, self.database)
+
+        # SQL-запрос
+        query = """
+        WITH index_stats AS (
+            SELECT 
+                i.relname AS index_name,
+                c.relname AS table_name,
+                pg_stat_user_indexes.idx_scan,
+                t.seq_scan + t.idx_scan AS total_scans,
+                CAST(pg_stat_user_indexes.idx_scan AS FLOAT) / NULLIF(t.seq_scan + t.idx_scan + 1, 0) AS itr
+            FROM pg_stat_user_indexes
+            JOIN pg_class c ON c.oid = pg_stat_user_indexes.relid
+            JOIN pg_class i ON i.oid = pg_stat_user_indexes.indexrelid
+            JOIN pg_stat_all_tables t ON t.relname = c.relname
+            -- Исключаем индексы первичных ключей
+            LEFT JOIN pg_index ix ON ix.indexrelid = i.oid AND ix.indisprimary = TRUE
+            WHERE ix.indexrelid IS NULL  -- Исключаем индексы первичных ключей
+        ),
+        quartile_stats AS (
+            SELECT 
+                table_name,
+                index_name,
+                idx_scan,
+                itr,
+                COUNT(index_name) OVER (PARTITION BY table_name) AS index_count,
+                CASE
+                    WHEN COUNT(index_name) OVER (PARTITION BY table_name) >= 4 THEN 
+                        NTILE(4) OVER (PARTITION BY table_name ORDER BY itr ASC)
+                    ELSE
+                        NULL -- Если индексов меньше 4, не считаем квартили
+                END AS quartile
+            FROM index_stats
+        )
+        SELECT 
+            table_name,
+            index_name,
+            idx_scan,
+            itr,
+            quartile
+        FROM quartile_stats
+        WHERE (index_count >= 4 AND quartile = 1)  -- Выбираем только первый квартиль
+           OR (index_count < 4 AND itr < %s)      -- Для таблиц с индексами меньше 4 и показываем c пограничной itr
+        ORDER BY table_name;
+        """
+
+        # Выполняем запрос
+        cursor.execute(query, (itr_threshold,))
+        rows = cursor.fetchall()
+        columns = ['table_name', 'index_name', 'idx_scan', 'itr', 'quartile']
+        result_df = pd.DataFrame(rows, columns=columns)
+
+        self.database_service.close_connection()
+
+        # Разделяем результаты
+        last_quartile_df = result_df[result_df['quartile'] == 1]  # Последний квартиль
+        below_threshold_df = result_df[result_df['itr'] < itr_threshold]  # ITR ниже порога
+
+        # Вывод результатов
+        print("Индексы в последнем квартиле (наименее используемые):\n")
+        if not last_quartile_df.empty:
+            print(last_quartile_df[['table_name', 'index_name', 'idx_scan', 'itr']].to_string(index=False))
+        else:
+            print("Нет индексов в последнем квартиле.\n")
+
+        print("\n⚠Индексы с ITR ниже порога ({0}):\n".format(itr_threshold))
+        if not below_threshold_df.empty:
+            print(below_threshold_df[['table_name', 'index_name', 'idx_scan', 'itr']].to_string(index=False))
+        else:
+            print("Нет индексов с ITR ниже порога.\n")
+
+    def search_for_redundant_indexes(self):
+
+        query = """
+            WITH composite_indexes AS (
+                SELECT 
+                    i.relname AS index_name,
+                    c.relname AS table_name,
+                    ix.indkey,
+                    array_to_string(array(
+                        SELECT 
+                            CASE
+                                WHEN k > 0 THEN
+                                    a.attname
+                                ELSE
+                                    pg_get_expr(ix.indexprs, ix.indrelid)
+                            END
+                        FROM unnest(ix.indkey) WITH ORDINALITY AS key_pos(k, ordinality)
+                        LEFT JOIN pg_attribute a ON a.attnum = key_pos.k AND a.attrelid = c.oid
+                    ), ', ') AS column_names
+                FROM pg_index ix
+                JOIN pg_class c ON c.oid = ix.indrelid
+                JOIN pg_class i ON i.oid = ix.indexrelid
+                WHERE ix.indisprimary = FALSE
+                AND c.relnamespace NOT IN (SELECT oid FROM pg_namespace WHERE nspname IN ('pg_catalog', 'information_schema'))
+                AND array_length(ix.indkey, 1) > 1
+            ),
+            simple_indexes AS (
+                SELECT 
+                    i.relname AS index_name,
+                    c.relname AS table_name,
+                    ix.indkey,
+                    array_to_string(array(
+                        SELECT 
+                            CASE
+                                WHEN k > 0 THEN
+                                    a.attname
+                                ELSE
+                                    pg_get_expr(ix.indexprs, ix.indrelid)
+                            END
+                        FROM unnest(ix.indkey) WITH ORDINALITY AS key_pos(k, ordinality)
+                        LEFT JOIN pg_attribute a ON a.attnum = key_pos.k AND a.attrelid = c.oid
+                    ), ', ') AS column_names
+                FROM pg_index ix
+                JOIN pg_class c ON c.oid = ix.indrelid
+                JOIN pg_class i ON i.oid = ix.indexrelid
+                WHERE ix.indisprimary = FALSE
+                AND c.relnamespace NOT IN (SELECT oid FROM pg_namespace WHERE nspname IN ('pg_catalog', 'information_schema'))
+                AND array_length(ix.indkey, 1) = 1
+            )
+            SELECT 
+                si.table_name,
+                si.index_name AS simple_index,
+                ci.index_name AS composite_index,
+                si.column_names AS simple_index_columns,
+                ci.column_names AS composite_index_columns
+            FROM simple_indexes si
+            JOIN composite_indexes ci 
+                ON si.table_name = ci.table_name
+                AND si.indkey[0] = ci.indkey[0]
+            ORDER BY si.table_name, si.index_name;
+        """
+
+        # Выполнение запроса
+        result_cursor = self.database_service.execute_query(query)
+
+        # Извлечение всех строк результата
+        results = result_cursor.fetchall()
+
+        self.database_service.close_connection()
+
+        # Группировка составных индексов по простой колонке (если несколько составных индексов для одной колонки)
+        grouped_results = defaultdict(list)
+
+        for row in results:
+            table_name, simple_index, composite_index, simple_columns, composite_columns = row
+            grouped_results[(table_name, simple_index, simple_columns)].append(composite_index)
+
+        # Вывод результата
+        for (table_name, simple_index, simple_columns), composite_indexes in grouped_results.items():
+            print(f"Таблица: {table_name}, Простой индекс: {simple_index}, Колонка простого индекса: {simple_columns}")
+            print("Составные индексы, содержащие эту колонку:")
+            for composite_index in composite_indexes:
+                print(f"  - {composite_index}")
+            print("=" * 80)
+
+    def setup_index_monitoring(self):
+
+        # Создание таблицы для статистики
+        create_table_query = """
+        CREATE TABLE IF NOT EXISTS index_usage_stats (
+        id SERIAL PRIMARY KEY,
+        index_name TEXT NOT NULL,
+        schema_name TEXT NOT NULL,
+        table_name TEXT NOT NULL,
+        total_scan_count BIGINT NOT NULL,
+        daily_scan_count BIGINT NOT NULL,
+        recorded_at DATE NOT NULL DEFAULT CURRENT_DATE,
+
+        -- Уникальное ограничение на индекс, схему, таблицу и дату
+        CONSTRAINT unique_index_daily_entry UNIQUE (index_name, schema_name, table_name, recorded_at)
+        );
+        """
+        self.database_service.execute_query(create_table_query)
+
+        # Создание функции для сбора статистики
+        create_function_query = """
+        CREATE OR REPLACE FUNCTION collect_index_usage_stats()
+        RETURNS void AS $$
+        BEGIN
+            INSERT INTO index_usage_stats (index_name, schema_name, table_name, total_scan_count, daily_scan_count, recorded_at)
+            SELECT
+                i.relname AS index_name,
+                n.nspname AS schema_name,
+                t.relname AS table_name,
+                ui.idx_scan AS total_scan_count,
+                COALESCE(ui.idx_scan - prev.total_scan_count, 0) AS daily_scan_count,
+                CURRENT_DATE
+            FROM
+                pg_stat_user_indexes ui
+                JOIN pg_index pi ON ui.indexrelid = pi.indexrelid
+                JOIN pg_class i ON pi.indexrelid = i.oid
+                JOIN pg_class t ON pi.indrelid = t.oid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                LEFT JOIN (
+                    SELECT index_name, total_scan_count
+                    FROM index_usage_stats
+                    WHERE recorded_at = CURRENT_DATE - INTERVAL '1 day'
+                ) prev ON i.relname = prev.index_name
+            WHERE 
+                pi.indisprimary = FALSE  -- Исключаем первичные ключи
+                AND COALESCE(ui.idx_scan - COALESCE(prev.total_scan_count, 0), 0) >= 0;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+        self.database_service.execute_query(create_function_query)
+
+        # Сохранение изменений
+        self.database_service.commit()
+        print("Функция и расписание успешно созданы.")
+
+        self.database_service.close_connection()
+
+    def create_windows_task(self, command):
+
+        try:
+            powershell_command = [
+                'powershell',
+                '-Command',
+                f'Start-Process cmd -ArgumentList \'/c {command}\' -Verb runAs'
+            ]
+            subprocess.run(powershell_command, check=True)
+            print("Задача в планировщике успешно создана.")
+        except subprocess.CalledProcessError as error:
+            print(f"Ошибка при создании задачи: {error}")
+
+    def create_task_collect_index_usage_stats(self):
+
+        # Путь к текущему скрипту
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        # Путь к файлу test.py в этой директории
+        script_path = os.path.join(script_dir, 'collect_index_usage_stats.py')
+        # Путь к Python-интерпретатору
+        python_executable = sys.executable
+
+        # Команда для создания задачи в планировщике
+        command = f'schtasks /Create /SC DAILY /TN "collect_index_usage_stats" /TR "\"{python_executable}\" \"{script_path}\"" /ST 01:00 /RL HIGHEST /F'
+        self.create_windows_task(command)
 
     def get_index_size(self, index_name):
         """Получить размер индекса"""
