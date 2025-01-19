@@ -372,16 +372,24 @@ class MyWindow(QtWidgets.QMainWindow):
         Функция для выбора нужнных таблиц
         :return:
         """
-        if self.help_data["on_tables"]:
-            self.choicetable_m.comboBox.addItems(self.help_data["on_tables"])
-        request = """SELECT table_name 
-            FROM information_schema.tables 
-            WHERE table_schema = 'public';"""
-        result = self.db_client.get_data(request=request)
-        table_list = self.get_from_str_list(text=result)
-        self.help_data["off_tables"] = [elem for elem in table_list if elem not in self.help_data["on_tables"]]
-        self.choicetable_m.comboBox_2.addItems(self.help_data["off_tables"])
-        self.choicetable_menu.show()
+        if self.db_client:
+            if self.help_data["on_tables"]:
+                self.choicetable_m.comboBox.addItems(self.help_data["on_tables"])
+            request = """SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'public';"""
+            result = self.db_client.get_data(request=request)
+            table_list = self.get_from_str_list(text=result)
+            self.help_data["off_tables"] = [elem for elem in table_list if elem not in self.help_data["on_tables"]]
+            self.choicetable_m.comboBox_2.addItems(self.help_data["off_tables"])
+            self.choicetable_menu.show()
+        else:
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Information)
+            msg.setWindowTitle("Подключение к БД")
+            msg.setStandardButtons(QMessageBox.Ok)
+            msg.setText("Произошла ошибка.")
+            msg.exec_()
 
     def add_all_tables(self):
         """
@@ -543,12 +551,20 @@ class MyWindow(QtWidgets.QMainWindow):
         Функция для выбора нужного метода анализа
         :return:
         """
-        if self.help_data["on_indexes"]:
-            self.choiceindex_m.comboBox.addItems(self.help_data["on_indexes"])
-        index_list = [elem["title"] for elem in self.SETTINGS["index_list"]]
-        self.help_data["off_indexes"] = [elem for elem in index_list if elem not in self.help_data["on_indexes"]]
-        self.choiceindex_m.comboBox_2.addItems(self.help_data["off_indexes"])
-        self.choiceindex_menu.show()
+        if self.db_client:
+            if self.help_data["on_indexes"]:
+                self.choiceindex_m.comboBox.addItems(self.help_data["on_indexes"])
+            index_list = [elem["title"] for elem in self.SETTINGS["index_list"]]
+            self.help_data["off_indexes"] = [elem for elem in index_list if elem not in self.help_data["on_indexes"]]
+            self.choiceindex_m.comboBox_2.addItems(self.help_data["off_indexes"])
+            self.choiceindex_menu.show()
+        else:
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Information)
+            msg.setWindowTitle("Подключение к БД")
+            msg.setStandardButtons(QMessageBox.Ok)
+            msg.setText("Произошла ошибка.")
+            msg.exec_()
 
     def add_all_indexes(self):
         """
@@ -614,6 +630,19 @@ class MyWindow(QtWidgets.QMainWindow):
         Функция для создания автономного скрипта Python.
         :return:
         """
+
+        if self.planer_m.checkBox.isChecked():
+            self.help_data["on_tables"].extend(self.help_data["off_tables"])
+            self.help_data["off_tables"] = list()
+        else:
+            self.help_data["off_tables"].extend(self.help_data["on_tables"])
+            self.help_data["on_tables"] = list()
+        if self.planer_m.checkBox_2.isChecked():
+            self.help_data["on_indexes"].extend(self.help_data["off_indexes"])
+            self.help_data["off_indexes"] = list()
+        else:
+            self.help_data["off_indexes"].extend(self.help_data["on_indexes"])
+            self.help_data["on_indexes"] = list()
         msg = QMessageBox()
         msg.setIcon(QMessageBox.Information)
         msg.setWindowTitle("Подключение к БД")
